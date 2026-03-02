@@ -1,10 +1,7 @@
 import { NextRequest } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
 import { retrieveRelevantLaws, formatCitations, buildSystemPrompt } from "@/lib/rag";
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY!,
-});
+const GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent";
 
 function sseEvent(data: object): string {
   return `data: ${JSON.stringify(data)}\n\n`;
@@ -12,6 +9,12 @@ function sseEvent(data: object): string {
 
 export async function POST(req: NextRequest) {
   const { message, history = [] } = await req.json();
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return new Response(sseEvent({ type: "error", message: "GEMINI_API_KEY not set" }), {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  }
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -23,45 +26,67 @@ export async function POST(req: NextRequest) {
         const systemPrompt = buildSystemPrompt(chunks);
 
         // Send citations first
-        controller.enqueue(
-          encoder.encode(sseEvent({ type: "citations", citations }))
-        );
+        controller.enqueue(encoder.encode(sseEvent({ type: "citations", citations })));
 
-        // Build conversation history (last 10 turns)
-        const recentHistory = history.slice(-10);
-        const messages: Anthropic.MessageParam[] = [
+        // Build conversation for Gemini
+        const recentHistory = history.slice(-8);
+        const contents = [
           ...recentHistory.map((h: { role: string; content: string }) => ({
-            role: h.role as "user" | "assistant",
-            content: h.content,
+            role: h.role === "assistant" ? "model" : "user",
+            parts: [{ text: h.content }],
           })),
-          { role: "user", content: message },
+          { role: "user", parts: [{ text: message }] },
         ];
 
-        // Stream from Claude
-        const claudeStream = anthropic.messages.stream({
-          model: "claude-sonnet-4-5",
-          max_tokens: 2048,
-          system: systemPrompt,
-          messages,
+        const body = {
+          system_instruction: { parts: [{ text: systemPrompt }] },
+          contents,
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 2048,
+          },
+        };
+
+        const res = await fetch(`${GEMINI_API}?key=${apiKey}&alt=sse`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
         });
 
-        for await (const event of claudeStream) {
-          if (
-            event.type === "content_block_delta" &&
-            event.delta.type === "text_delta"
-          ) {
-            controller.enqueue(
-              encoder.encode(sseEvent({ type: "delta", text: event.delta.text }))
-            );
+        if (!res.ok || !res.body) {
+          const err = await res.text();
+          throw new Error(`Gemini error ${res.status}: ${err.slice(0, 200)}`);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const raw = line.slice(6).trim();
+            if (!raw || raw === "[DONE]") continue;
+            try {
+              const evt = JSON.parse(raw);
+              const text = evt?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+              if (text) {
+                controller.enqueue(encoder.encode(sseEvent({ type: "delta", text })));
+              }
+            } catch { /* skip */ }
           }
         }
 
         controller.enqueue(encoder.encode(sseEvent({ type: "done" })));
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        controller.enqueue(
-          encoder.encode(sseEvent({ type: "error", message }))
-        );
+        const msg = err instanceof Error ? err.message : "Unknown error";
+        controller.enqueue(encoder.encode(sseEvent({ type: "error", message: msg })));
       } finally {
         controller.close();
       }

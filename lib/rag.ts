@@ -1,76 +1,91 @@
-import supabase from "./supabase";
 import type { Citation, RetrievedChunk } from "./types";
 
-interface RawChunk {
-  work_id: string;
-  content: string;
-  snippet?: string;
+const PASAL_API = "https://pasal.id/api/v1";
+
+interface SearchResult {
+  work_id: number;
+  snippet: string;
   score: number;
-  metadata?: {
-    pasal?: string;
-    type?: string;
-    year?: number;
-    title?: string;
-  };
+  matching_pasals: string[];
+  work: { frbr_uri: string; title: string; number: string; year: number; status: string; type: string; };
 }
 
-interface WorkRow {
-  id: string;
-  title_id: string;
-  status: string;
-  year: number;
-  regulation_types?: { code: string } | null;
-}
-
-export async function retrieveRelevantLaws(
-  query: string,
-  limit = 8
-): Promise<RetrievedChunk[]> {
+async function searchPasal(query: string, limit: number): Promise<RetrievedChunk[]> {
   try {
-    const { data: chunks, error } = await supabase.rpc("search_legal_chunks", {
-      query_text: query,
-      match_count: limit * 3,
-      metadata_filter: {},
+    const params = new URLSearchParams({ q: query, limit: String(limit) });
+    const res = await fetch(`${PASAL_API}/search?${params}`, {
+      headers: { "User-Agent": "PasalChat/1.0" },
+      next: { revalidate: 0 },
     });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.results ?? []).map((r: SearchResult) => ({
+      work_id: String(r.work_id),
+      law_title: r.work.title,
+      regulation_type: r.work.type,
+      year: r.work.year,
+      pasal: r.matching_pasals?.[0] ?? "",
+      snippet: r.snippet?.slice(0, 500) ?? "",
+      status: r.work.status,
+      relevance_score: r.score,
+    }));
+  } catch { return []; }
+}
 
-    if (error || !chunks?.length) return [];
-
-    // Fetch work metadata
-    const workIds = [...new Set((chunks as RawChunk[]).map((c) => c.work_id))];
-    const { data: works } = await supabase
-      .from("works")
-      .select("id, title_id, status, year, regulation_types(code)")
-      .in("id", workIds);
-
-    const worksMap = new Map(
-      (works as WorkRow[] || []).map((w) => [w.id, w])
-    );
-
-    // Deduplicate by work_id, keep highest score
-    const seen = new Map<string, RetrievedChunk>();
-    for (const chunk of chunks as RawChunk[]) {
-      const work = worksMap.get(chunk.work_id);
-      if (!work) continue;
-      const existing = seen.get(chunk.work_id);
-      if (existing && existing.relevance_score >= chunk.score) continue;
-      seen.set(chunk.work_id, {
-        work_id: chunk.work_id,
-        law_title: work.title_id,
-        regulation_type: work.regulation_types?.code ?? chunk.metadata?.type ?? "",
-        year: work.year ?? chunk.metadata?.year ?? 0,
-        pasal: chunk.metadata?.pasal ?? "",
-        snippet: chunk.snippet ?? chunk.content?.slice(0, 300) ?? "",
-        status: work.status,
-        relevance_score: chunk.score,
-      });
+export async function retrieveRelevantLaws(query: string, limit = 8): Promise<RetrievedChunk[]> {
+  // Multi-query strategy: run parallel searches with different terms for better recall
+  const terms = extractSearchTerms(query);
+  const searches = await Promise.all(terms.map(t => searchPasal(t, limit)));
+  
+  // Merge and deduplicate by work_id, sum scores
+  const merged = new Map<string, RetrievedChunk>();
+  for (const results of searches) {
+    for (const r of results) {
+      const existing = merged.get(r.work_id);
+      if (existing) {
+        existing.relevance_score = Math.max(existing.relevance_score, r.relevance_score);
+      } else {
+        merged.set(r.work_id, { ...r });
+      }
     }
-
-    return [...seen.values()]
-      .sort((a, b) => b.relevance_score - a.relevance_score)
-      .slice(0, limit);
-  } catch {
-    return [];
   }
+  
+  return [...merged.values()]
+    .sort((a, b) => b.relevance_score - a.relevance_score)
+    .slice(0, limit);
+}
+
+function extractSearchTerms(query: string): string[] {
+  const terms = [query];
+  
+  // Legal term mappings for better Indonesian FTS
+  const mappings: Record<string, string> = {
+    "cuti": "cuti tahunan ketenagakerjaan",
+    "gaji": "upah minimum ketenagakerjaan",
+    "phk": "pemutusan hubungan kerja",
+    "pt": "perseroan terbatas",
+    "kontrak": "perjanjian kerja waktu tertentu",
+    "data pribadi": "perlindungan data pribadi UU 27 2022",
+    "pidana": "kitab undang-undang hukum pidana",
+    "terdakwa": "hak terdakwa hukum acara pidana",
+    "cerai": "perceraian perkawinan",
+    "waris": "hukum waris",
+    "pajak": "pajak penghasilan",
+  };
+  
+  const lower = query.toLowerCase();
+  for (const [key, mapped] of Object.entries(mappings)) {
+    if (lower.includes(key)) {
+      terms.push(mapped);
+      break;
+    }
+  }
+  
+  // Add key noun phrases (simple extraction)
+  const words = query.split(/\s+/).filter(w => w.length > 4);
+  if (words.length > 2) terms.push(words.slice(0, 3).join(" "));
+  
+  return [...new Set(terms)].slice(0, 3);
 }
 
 export function formatCitations(chunks: RetrievedChunk[]): Citation[] {
@@ -81,31 +96,33 @@ export function formatCitations(chunks: RetrievedChunk[]): Citation[] {
     year: c.year,
     snippet: c.snippet,
     status: (c.status as Citation["status"]) ?? "berlaku",
-    relevanceScore: c.relevance_score,
+    relevanceScore: Math.min(c.relevance_score / 10, 1),
   }));
 }
 
 export function buildSystemPrompt(chunks: RetrievedChunk[]): string {
-  const context = chunks
-    .map(
-      (c, i) =>
-        `[${i + 1}] ${c.regulation_type} No. ${c.year} — ${c.law_title}\n` +
-        `${c.pasal ? `Pasal ${c.pasal}: ` : ""}${c.snippet}`
-    )
-    .join("\n\n");
+  if (!chunks.length) {
+    return `You are Pasal Assistant — an AI legal assistant for Indonesian law.
+No specific articles were retrieved for this query. Inform the user and suggest searching at pasal.id.
+Always respond in the user's language. Add: ⚠️ Ini bukan nasihat hukum.`;
+  }
 
-  return `You are Pasal Assistant — an expert AI legal assistant specializing in Indonesian law (hukum Indonesia).
+  const context = chunks.map((c, i) =>
+    `[${i+1}] ${c.regulation_type} No. ${c.year} — ${c.law_title}\n` +
+    `${c.pasal ? `Pasal ${c.pasal}: ` : ""}${c.snippet}`
+  ).join("\n\n---\n\n");
 
-RETRIEVED LEGAL CONTEXT (use ONLY these sources for citations):
-${context || "No specific laws retrieved for this query."}
+  return `You are Pasal Assistant — an expert AI legal assistant for Indonesian law (hukum Indonesia).
+Answer questions based ONLY on the retrieved legal context below.
+
+RETRIEVED LEGAL CONTEXT:
+${context}
 
 RULES:
-1. ONLY cite laws that appear in the retrieved context above. Never invent article numbers.
-2. Citation format: "Pasal [X] [TYPE] No. [Y] Tahun [Z]" — e.g., "Pasal 81 UU No. 13 Tahun 2003"
-3. If the context doesn't cover the question, say so clearly and suggest consulting a lawyer.
-4. Respond in the SAME language as the user (Indonesian if they write in Indonesian, English if English).
-5. Structure your answer: brief direct answer → supporting articles → important caveats.
-6. End with disclaimer: "⚠️ Ini bukan nasihat hukum. Selalu konsultasikan dengan pengacara untuk kasus spesifik."
-
-Be precise, authoritative, and grounded. You are a legal research tool, not a chatbot.`;
+1. ONLY cite laws from the context above. Never invent article numbers.
+2. Citation format: "Pasal X [TYPE] No. Y Tahun Z tentang [topic]"
+3. Structure: direct answer → cited articles → caveats
+4. Respond in the SAME language as the user (Indonesian if Indonesian, English if English)
+5. If context is insufficient for a complete answer, say so clearly
+6. End every response with: "⚠️ Ini bukan nasihat hukum. Konsultasikan dengan pengacara untuk kasus spesifik."`;
 }
